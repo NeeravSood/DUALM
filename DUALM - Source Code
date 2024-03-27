@@ -1,0 +1,759 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.quantization import quantize_dynamic
+from sklearn.ensemble import RandomForestRegressor
+import numpy as np
+
+class DiverseMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+
+        self.scaling = self.head_dim ** -0.5
+
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.attention_dropout = nn.Dropout(dropout)
+
+        # Parameters for diversity regularization
+        self.diversity_weight = nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True):
+        batch_size, seq_length, _ = query.size()
+        qkv = self.qkv_proj(torch.cat([query, key, value], dim=-1))
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+
+        q = q * self.scaling
+
+        q = q.contiguous().view(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.contiguous().view(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.contiguous().view(batch_size, seq_length, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn_output_weights = torch.matmul(q, k.transpose(-2, -1))
+        if key_padding_mask is not None:
+            attn_output_weights = attn_output_weights.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+        attn_output_weights = F.softmax(attn_output_weights, dim=-1)
+        attn_output_weights = self.attention_dropout(attn_output_weights)
+
+        attn_output = torch.matmul(attn_output_weights, v)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+
+        if need_weights:
+            return attn_output, attn_output_weights.sum(dim=1) / self.num_heads
+        else:
+            return attn_output
+
+    def diversity_regularization(self, attention_weights):
+        """
+        Encourage diversity among attention heads by penalizing similarity in their attention patterns.
+        This is a simplified example that would need to be adapted based on specific requirements.
+        """
+        num_heads = attention_weights.size(1)
+        diversity_loss = 0
+        # Simple pairwise penalty example: minimize the cosine similarity between different heads' attention patterns.
+        for i in range(num_heads):
+            for j in range(i + 1, num_heads):
+                cos_sim = F.cosine_similarity(attention_weights[:, i], attention_weights[:, j], dim=-1).mean()
+                diversity_loss += cos_sim
+        return diversity_loss / (num_heads * (num_heads - 1) / 2)
+
+class RelativePositionalEncoding(nn.Module):
+    """
+    Implements relative positional encoding with dynamic adjustment for variable sequence lengths.
+    This version generates positional encodings on the fly for efficient memory usage.
+    """
+    def __init__(self, embed_size, max_len=5000):
+        super().__init__()
+        self.embed_size = embed_size
+        # Initialize positional encoding matrix with zeros, then fill with generated encodings.
+        self.pe = nn.Parameter(torch.zeros(max_len, embed_size), requires_grad=False)
+        # Register pe as a buffer to ensure it's properly handled by PyTorch's model utilities.
+        self.register_buffer('pe', self._generate_encoding(max_len, embed_size), persistent=False)
+
+    def _generate_encoding(self, max_len, embed_size):
+        """
+        Generates the positional encoding matrix.
+        """
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_size, 2).float() * (-math.log(10000.0) / embed_size))
+        pe = torch.zeros(max_len, embed_size)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def forward(self, x):
+        """
+        Retrieves the positional encoding for the input sequence length.
+        """
+        seq_len = x.size(1)
+        return self.pe[:seq_len, :].detach()
+
+    def get_pe(self, length):
+        """
+        A utility method to get positional encoding for a specific length outside the forward pass.
+        Useful for debugging or direct access scenarios.
+        """
+        return self.pe[:length, :].detach()
+
+class LocalAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads, window_size, dropout_rate, batch_first=True):
+        super(LocalAttention, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, dropout=dropout_rate, batch_first=batch_first)
+        self.window_size = window_size
+
+    def forward(self, x, attn_mask=None):
+        # Local attention mask can be created based on the sequence length and window size.
+        # Here, a simplistic approach is adopted; for production, you might need a more sophisticated method.
+        if attn_mask is None:
+            batch_size, seq_len, _ = x.shape
+            attn_mask = torch.full((batch_size, seq_len, seq_len), float('-inf')).to(x.device)
+            for batch in range(batch_size):
+                for i in range(seq_len):
+                    start = max(0, i - self.window_size)
+                    end = min(seq_len, i + self.window_size + 1)
+                    attn_mask[batch, i, start:end] = 0
+
+        # Apply attention
+        attn_output, _ = self.multihead_attn(x, x, x, attn_mask=attn_mask)
+        return attn_output
+
+
+class MultiLevelAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads=1, dropout_rate=0.1, ff_intermediate_size=None,
+                 activation_function='relu', max_length=500, attention_variant='default', use_dynamic_pe=False,
+                 enable_diversity=False):
+        super(MultiLevelAttention, self).__init__()
+
+        self.attention_variant = attention_variant
+        self.use_dynamic_pe = use_dynamic_pe
+        self.enable_diversity = enable_diversity
+
+        if enable_diversity:
+            self.self_attention = DiverseMultiheadAttention(hidden_size, num_heads, dropout_rate)
+        else:
+            self.self_attention = self._initialize_attention(hidden_size, num_heads, dropout_rate, attention_variant,
+                                                             batch_first=True)
+
+        self.norm1 = nn.LayerNorm(hidden_size)
+
+        if use_dynamic_pe:
+            self.positional_encoding = RelativePositionalEncoding(max_length, hidden_size)
+        else:
+            self.positional_encoding = self.create_positional_encoding(max_length, hidden_size)
+
+        ff_intermediate_size = ff_intermediate_size or 4 * hidden_size
+        self.activation = getattr(nn, activation_function.capitalize(), nn.ReLU)()
+
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_size, ff_intermediate_size),
+            self.activation,
+            nn.Dropout(dropout_rate),
+            nn.Linear(ff_intermediate_size, hidden_size)
+        )
+
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # Cross-level attention as an option
+        self.cross_attention = None
+        if 'cross' in attention_variant:
+            self.cross_attention = self._initialize_attention(hidden_size, num_heads, dropout_rate, 'default',
+                                                              batch_first=True)
+            self.norm3 = nn.LayerNorm(hidden_size)
+
+    def _initialize_attention(self, hidden_size, num_heads, dropout_rate, variant, batch_first=True):
+        if variant == 'local':
+            return LocalAttention(hidden_size, num_heads, window_size=50, dropout_rate=dropout_rate,
+                                  batch_first=batch_first)
+        else:  # Default to nn.MultiheadAttention for other cases
+            return nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, dropout=dropout_rate,
+                                         batch_first=batch_first)
+
+    def create_positional_encoding(self, max_length, hidden_size):
+        position = torch.arange(0, max_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, hidden_size, 2).float() * -(math.log(10000.0) / hidden_size))
+
+        pe = torch.zeros(max_length, hidden_size)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        return pe.unsqueeze(0)
+
+    def forward(self, x):
+        seq_length = x.size(1)
+
+        # Apply positional encoding
+        if self.use_dynamic_pe:
+            pe = self.positional_encoding(x)
+        else:
+            pe = self.positional_encoding[:, :seq_length, :].to(x.device)
+        x = x + pe
+
+        # Self-attention
+        attn_output, _ = self.self_attention(x, x, x)
+        x = x + self.dropout(attn_output)
+        x = self.norm1(x)
+
+        # Feedforward
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout(ff_output)
+        x = self.norm2(x)
+
+        # Cross-level attention if enabled
+        if self.cross_attention is not None:
+            cross_attn_output, _ = self.cross_attention(x, x, x)
+            x = x + self.dropout(cross_attn_output)
+            x = self.norm3(x)
+
+        return x
+
+
+class DynamicInputEmbedding(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, context_size, use_context=True, dropout_rate=0.1, num_tasks=0):
+        super(DynamicInputEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.use_context = use_context
+        self.dropout = nn.Dropout(dropout_rate)
+        #self.dropout = nn.ModuleList([nn.Dropout(rate) for rate in (dropout_rate or [0.1] * (2 + len(context_size)))])
+
+        if self.use_context:
+            self.context_transformations = nn.ModuleList(
+                [nn.Linear(size, embedding_dim) for size in context_size]
+            )
+
+        if num_tasks > 0:
+            self.task_embedding = nn.Embedding(num_tasks, embedding_dim)
+        else:
+            self.task_embedding = None
+
+    def forward(self, token_ids, external_contexts=None, task_id=None, positions=None):
+        vocab_size = self.embedding.num_embeddings
+        token_ids = token_ids.long().clamp(0, vocab_size - 1)
+        embedded_tokens = self.embedding(token_ids)
+
+        if positions is not None:
+            position_embeddings = self.positional_embedding(positions)
+            embedded_tokens += position_embeddings
+        embedded_tokens = self.dropout(embedded_tokens)
+
+        if self.use_context and external_contexts is not None:
+            num_transformations = len(self.context_transformations)
+            for i in range(min(len(external_contexts), num_transformations)):
+                context = external_contexts[i]
+                if context.numel() < 256:
+                    padding_size = 256 - context.numel()
+                    context_padded = F.pad(context, (0, padding_size), 'constant', 0)
+                else:
+                    context_padded = context[:256]
+
+                processed_context = context_padded.view(-1, 256).float()
+                if processed_context.size(0) != embedded_tokens.size(0):
+                    processed_context = processed_context.expand(embedded_tokens.size(0), -1)
+
+                transformed_context = self.context_transformations[i](processed_context)
+                transformed_context = transformed_context.unsqueeze(1).repeat(1, embedded_tokens.size(1), 1)
+                embedded_tokens += transformed_context
+
+        if self.task_embedding is not None and task_id is not None:
+            task_emb = self.task_embedding(task_id)
+            task_emb = self.dropout(task_emb.unsqueeze(1).repeat(1, embedded_tokens.size(1), 1))
+            embedded_tokens += task_emb
+
+        return embedded_tokens
+
+class AdaptiveAttentionModule(nn.Module):
+    """
+    An adaptive attention module that implements a more sophisticated attention mechanism,
+    allowing the model to dynamically focus on different parts of the input sequence.
+
+    Args:
+        input_dim (int): The size of the input features.
+        hidden_dim (int): The size of the hidden state for the attention mechanism.
+        output_dim (int): The size of the output features.
+        num_heads (int): The number of attention heads.
+    """
+
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_heads):
+            super(AdaptiveAttentionModule, self).__init__()
+            self.num_heads = num_heads
+            self.hidden_dim = hidden_dim
+            self.output_dim = output_dim
+
+            # Ensure the hidden dimension is compatible with the number of heads
+            if hidden_dim % num_heads != 0:
+                raise ValueError("hidden_dim must be divisible by num_heads.")
+
+            self.scaling_factor = (hidden_dim // num_heads) ** -0.5
+
+            # Define linear layers for queries, keys, and values correctly based on the actual input_dim
+            self.query = nn.Linear(input_dim, hidden_dim)  # Adjust input_dim accordingly
+            self.key = nn.Linear(input_dim, hidden_dim)
+            self.value = nn.Linear(input_dim, hidden_dim)
+
+            # Linear layer for output projection
+            self.output_proj = nn.Linear(hidden_dim, output_dim)
+
+
+    def forward(self, x):
+        # Split input into multiple heads for multi-head attention
+        batch_size = x.size(0)
+
+        # Shape transformations for multi-head attention
+        # Query: [Batch, Num Heads, Seq Len, Head Dim]
+        # Key: [Batch, Num Heads, Head Dim, Seq Len]
+        # Value: [Batch, Num Heads, Seq Len, Head Dim]
+        query = self.query(x).view(batch_size, -1, self.num_heads, self.hidden_dim // self.num_heads).transpose(1, 2)
+        key = self.key(x).view(batch_size, -1, self.num_heads, self.hidden_dim // self.num_heads).transpose(1, 2)
+        value = self.value(x).view(batch_size, -1, self.num_heads, self.hidden_dim // self.num_heads).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling_factor
+        attention = F.softmax(scores, dim=-1)
+
+        # Combine heads
+        context = torch.matmul(attention, value)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_dim)
+
+        # Apply the final linear layer and return
+        return self.output_proj(context)
+
+class SparseAttention(nn.Module):
+    # Adding a learned sparsity pattern as an enhancement
+    def __init__(self, input_dim, seq_len, sparsity_factor=4):
+        super().__init__()
+        self.scale = 1.0 / (input_dim ** 0.5)
+        self.query = nn.Linear(input_dim, input_dim)
+        self.key = nn.Linear(input_dim, input_dim)
+        self.value = nn.Linear(input_dim, input_dim)
+
+        # Learned sparsity pattern
+        self.attention_mask = nn.Parameter(torch.randn(seq_len, seq_len))
+        self.sparsity_factor = sparsity_factor
+
+    def forward(self, x, mask=None):
+        Q = self.query(x)
+        K = self.key(x).transpose(-2, -1)
+        V = self.value(x)
+
+        # Generate sparse mask
+        sparse_mask = torch.topk(self.attention_mask, k=self.sparsity_factor, dim=-1)[0]
+
+        attention_scores = torch.matmul(Q, K) * self.scale
+        attention_scores += sparse_mask
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
+        attention = F.softmax(attention_scores, dim=-1)
+
+        return torch.matmul(attention, V)
+
+
+class GlobalAttention(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.scale = 1.0 / (input_dim ** 0.5)
+        self.query = nn.Linear(input_dim, input_dim)
+        self.key = nn.Linear(input_dim, input_dim)
+        self.value = nn.Linear(input_dim, input_dim)
+
+    def forward(self, x, mask=None):
+        Q = self.query(x)
+        K = self.key(x)
+        V = self.value(x)
+
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        if mask is not None:
+            # Expanding mask for compatibility with attention scores
+            mask = mask.unsqueeze(1).expand(-1, Q.size(1), -1)
+            attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
+
+        attention = F.softmax(attention_scores, dim=-1)
+        return torch.matmul(attention, V)
+
+
+class ModularAttention(nn.Module):
+    def __init__(self, input_dim, mode='sparse'):
+        super().__init__()
+        self.mode = mode
+        self.attention_mechanisms = nn.ModuleDict({
+            'sparse': SparseAttention(input_dim),
+            'global': GlobalAttention(input_dim),
+            # Add other attention mechanisms as needed
+        })
+
+    def forward(self, x, mask=None):
+        # Select and apply the appropriate attention mechanism
+        if self.mode in self.attention_mechanisms:
+            return self.attention_mechanisms[self.mode](x, mask)
+        else:
+            raise ValueError(f"Unrecognized attention mode: {self.mode}")
+
+def generate_sparsity_mask(size, pattern='local', window_size=10, use_sparse=True):
+    if pattern == 'local':
+        # Efficient local mask generation using broadcasting for dense mask
+        rows = torch.arange(size).unsqueeze(1)
+        cols = torch.arange(size)
+        dense_mask = torch.abs(rows - cols) <= window_size
+
+        if use_sparse:
+            # Convert dense mask to sparse
+            indices = torch.nonzero(dense_mask).t()
+            values = torch.ones(indices.shape[1])
+            mask = torch.sparse.FloatTensor(indices, values, dense_mask.size()).to_dense()
+        else:
+            mask = dense_mask.float()
+    elif pattern == 'global':
+        # Example of a simplistic global pattern; adjust as needed
+        if use_sparse:
+            indices = torch.nonzero(torch.ones(size, size)).t()
+            values = torch.ones(indices.shape[1])
+            mask = torch.sparse.FloatTensor(indices, values, torch.Size([size, size])).to_dense()
+        else:
+            mask = torch.ones(size, size)
+    else:
+        raise ValueError(f"Unknown sparsity pattern: {pattern}")
+    return mask
+
+class DynamicKWinnersTakeAll(torch.nn.Module):
+    def __init__(self, sparsity_level):
+        super(DynamicKWinnersTakeAll, self).__init__()
+        # Initialize a learnable parameter for dynamic adjustment
+        self.sparsity_level = torch.nn.Parameter(torch.tensor(sparsity_level))
+
+    def forward(self, input):
+        batch_size, seq_length, num_features = input.shape
+        # Dynamically compute k based on the current sparsity level
+        k = max(1, int(torch.sigmoid(self.sparsity_level) * num_features))
+
+        reshaped_input = input.view(-1, num_features)  # Flatten to 2D for processing
+        topk, indices = torch.topk(reshaped_input, k, dim=1)
+        threshold = topk[:, -1].unsqueeze(1).expand_as(reshaped_input)
+        output = torch.where(reshaped_input >= threshold, reshaped_input, torch.zeros_like(reshaped_input))
+
+        # Reshape output back to original input shape
+        return output.view(batch_size, seq_length, num_features)
+
+class DynamicLayerAdjustment(nn.Module):
+            """
+            Dynamically adjust and select between different neural network layer types.
+
+            Args:
+                max_layers (int): Maximum number of layers.
+                input_size (int): Size of input features.
+                hidden_size (int): Size of hidden features.
+                dropout_rate (float): Dropout rate.
+                activation (str): Activation function.
+            """
+
+            def __init__(self, max_layers, input_size, hidden_size, num_heads, dropout_rate=0.1, activation='relu'):
+                super(DynamicLayerAdjustment, self).__init__()
+                if max_layers <= 0:
+                    raise ValueError("max_layers must be a positive integer.")
+
+                self.max_layers = max_layers
+                self.layer_selectors = nn.ModuleList([nn.Linear(hidden_size, 4) for _ in range(max_layers)])
+                self.dropout = nn.Dropout(dropout_rate)
+
+                # Defining layer types
+                self.lstm_layers = nn.ModuleList(
+                    [nn.LSTM(input_size, hidden_size, batch_first=True) for _ in range(max_layers)])
+                self.gru_layers = nn.ModuleList(
+                    [nn.GRU(input_size, hidden_size, batch_first=True) for _ in range(max_layers)])
+                self.attention_layers = nn.ModuleList(
+                    [AdaptiveAttentionModule(hidden_size, hidden_size, hidden_size, num_heads) for _ in
+                     range(max_layers)])
+                self.feedforward_layers = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(hidden_size, hidden_size * 4),
+                        DynamicKWinnersTakeAll(sparsity_level=0.1),
+                        nn.Dropout(dropout_rate),
+                        nn.Linear(hidden_size * 4, hidden_size)
+                    ) for _ in range(max_layers)
+                ])
+
+                # Softmax for layer selection
+                self.selection_softmax = nn.Softmax(dim=1)
+
+            def forward(self, x):
+                    for i in range(self.max_layers):
+                        selection_scores = F.gumbel_softmax(self.layer_selectors[i](x[:, -1, :]), dim=1)
+
+                        lstm_output, _ = self.lstm_layers[i](x)
+                        gru_output, _ = self.gru_layers[i](x)
+                        attention_output = self.attention_layers[i](x)
+                        feedforward_output = self.feedforward_layers[i](x)
+
+                        # Dynamic composition of layer outputs
+                        layer_outputs = (selection_scores[:, 0:1].unsqueeze(-1) * lstm_output +
+                                         selection_scores[:, 1:2].unsqueeze(-1) * gru_output +
+                                         selection_scores[:, 2:3].unsqueeze(-1) * attention_output +
+                                         selection_scores[:, 3:4].unsqueeze(-1) * feedforward_output)
+
+                        # Update x for the next layer
+                        x = layer_outputs + x  # Residual connection could be considered
+
+                    return x
+
+class DUALM(nn.Module):
+    def __init__(self, hidden_size, output_size, max_layers, num_heads, vocab_size, embedding_dim, context_size, dropout, share_embedding_output, num_tasks, input_size=256, intermediate_size = 512, desired_size=10000):
+        super(DUALM, self).__init__()
+
+        # Initialize the input embedding module.
+        self.input_embedding = DynamicInputEmbedding(vocab_size, embedding_dim, context_size, use_context=True, dropout_rate=dropout)
+        self.expansion_layer = nn.Linear(256, 512)  # Correct input and output sizes
+        # Initialize adjustment_layer to adjust features from 512 to desired_size
+        self.adjustment_layer = nn.Linear(512, desired_size)
+        # Initialize the attention module. This might require adjustments if the attention module's parameters are different.
+        desired_size = 10000
+        self.adjustment_layer = nn.Linear(input_size, desired_size)
+
+        # Initialize the dynamic layer adjustment module. Ensure the parameters match the expected initialization.
+        self.dynamic_layer_adjustment = DynamicLayerAdjustment(max_layers, hidden_size, hidden_size, num_heads, dropout)
+
+        # Initialize the output layer. Conditionally share weights if specified.
+        if share_embedding_output and embedding_dim == hidden_size:
+            self.output_layer = nn.Linear(hidden_size, output_size)
+            self.output_layer.weight = self.input_embedding.embedding.weight
+        else:
+            self.output_layer = nn.Linear(hidden_size, output_size)
+
+        # Task embedding layer
+        self.task_embedding = nn.Embedding(num_tasks, embedding_dim)
+
+    def compute_loss(self, predicted_output, y):
+        return F.cross_entropy(predicted_output, y)
+
+    def reset_module_usage(self):
+        # Example reset logic - customize based on actual use case
+        self.using_attention = False  # Assuming there's a flag to track attention usage
+        self.using_dynamic_layers = False  # Assuming there's a flag for dynamic layer adjustment
+        # Reset other flags or configurations as needed
+
+    def select_modules(self, task_identifier):
+        # Reset module usage to a default state
+        self.reset_module_usage()
+
+        # Define module usage for different tasks
+        module_configurations = {
+            'translation': {'use_attention': True, 'use_dynamic_layer_adjustment': True,
+                            'use_modular_attention': 'global'},
+            'summarization': {'use_attention': True, 'use_dynamic_layer_adjustment': False,
+                              'use_modular_attention': 'sparse'},
+            # Add additional tasks and their configurations here
+        }
+
+        task_to_id = {
+            'translation': 0,
+            'summarization': 1,
+            # Add more tasks as needed
+        }
+        # Example task identifier
+        task_identifier = 'translation'
+        task_id = task_to_id[task_identifier]  # Convert task identifier to integer
+
+        # Apply the configuration for the current task
+        if task_identifier in module_configurations:
+            for key, value in module_configurations[task_identifier].items():
+                setattr(self, key, value)
+        else:
+            raise ValueError(f"Unrecognized task identifier: {task_identifier}")
+
+        # Make sure task_id is an integer at this point.
+        output = dualm_model(x, token_ids, external_context, task_id)
+
+    def forward(self, x, token_ids, external_context, task_id):
+        # Apply task embedding
+        # Assuming task_identifier is a string like 'translation' and you have a mapping to integers
+        task_mapping = {'translation': 0, 'summarization': 1}  # Example mapping
+        task_id = task_mapping.get(task_identifier)  # Convert string identifier to integer
+
+        # Ensure task_id is not None and is an integer
+        if task_id is None:
+            raise ValueError(f"Task identifier {task_identifier} is not recognized.")
+
+        # Convert task_id to tensor
+        task_id_tensor = torch.tensor([task_id], dtype=torch.long).to(x.device)
+
+        # Convert task_id to a tensor if it's not already one. This is for a single task_id for the whole batch.
+        if not isinstance(task_id, torch.Tensor):
+            task_id_tensor = torch.tensor([task_id], dtype=torch.long).to(x.device)
+        else:
+            task_id_tensor = task_id.to(x.device)
+
+        # Use task_id_tensor for embedding
+        task_embed = self.task_embedding(task_id_tensor)
+        task_embed = task_embed.unsqueeze(0).expand(x.size(0), -1, -1)
+        task_embed = task_embed.expand(x.size(0), x.size(1), -1)
+
+        # Ensure the last dimension of x is 10000 for adjustment_layer
+        # Ensure the last dimension of x is 10000 for adjustment_layer
+        desired_size = 10000
+        batch_size, seq_length, features = x.shape
+        # Check if reshaping is needed
+        x = self.expansion_layer(x)
+        x = self.adjustment_layer(x)
+        x = self.input_embedding(x, token_ids, external_context)
+        x = self.attention_module(x)
+        x = self.dynamic_layer_adjustment(x)
+        print(f"Shape of x before adjustment_layer: {x.shape}")
+        x = self.adjustment_layer(x)
+        print(f"Shape of x after adjustment_layer: {x.shape}")
+        return x
+
+    def cross_lingual_adaptation(self, target_language_data_loader, optimizer, num_epochs=3):
+        self.train()
+        for epoch in range(num_epochs):
+            for batch_idx, (x, token_ids, external_context, y) in enumerate(target_language_data_loader):
+                optimizer.zero_grad()
+                predicted_output = self.forward(x, token_ids, external_context)
+                loss = self.compute_loss(predicted_output, y)
+                loss.backward()
+                optimizer.step()
+
+                if batch_idx % 100 == 0:
+                    print(f'Epoch: {epoch + 1}, Batch: {batch_idx}, Loss: {loss.item()}')
+
+class ModuleRegistry:
+    modules = {}
+
+    @classmethod
+    def register_module(cls, key, module_class):
+        cls.modules[key] = module_class
+
+    @classmethod
+    def get_module(cls, key):
+        module_class = cls.modules.get(key)
+        if module_class:
+            return module_class()
+        else:
+            raise ValueError(f"Module {key} not found")
+
+class HierarchicalDUALM(DUALM):
+    def __init__(self, input_size, hidden_size, output_size, max_layers, num_heads, vocab_size, embedding_dim, context_size, dropout, share_embedding_output, max_input_length, latency_threshold=0.5, threshold_high=0.75, threshold_low=0.25):
+        super(HierarchicalDUALM, self).__init__(input_size, hidden_size, output_size, max_layers, num_heads, vocab_size, embedding_dim, context_size, dropout, share_embedding_output)
+        self.max_input_length = max_input_length
+        self.latency_threshold = latency_threshold
+        self.threshold_high = threshold_high
+        self.threshold_low = threshold_low
+        self.complexity_estimator = RandomForestRegressor()
+        self.current_layers = max_layers
+        # Initialize a dictionary to store runtime feedback signals
+        self.feedback_signals = {}
+
+    def extract_complexity_features(self, token_ids, external_context):
+        # Placeholder function for extracting features indicative of task complexity
+        features = {}
+        features['token_diversity'] = len(set(token_ids)) / len(token_ids)
+        features['sequence_length'] = len(token_ids) / self.max_input_length
+        # Add more feature extractions here, such as semantic complexity or key phrases
+        # Convert features to a format suitable for the complexity estimator
+        feature_vector = np.array(list(features.values())).reshape(1, -1)
+        return feature_vector
+
+    def estimate_task_complexity(self, x, token_ids, external_context):
+        features = self.extract_complexity_features(token_ids, external_context)
+        complexity_estimate = self.complexity_estimator.predict(features)[0]
+        return complexity_estimate
+
+
+    def adjust_model_configuration_based_on_task(self, task_identifier):
+            required_complexity = self.estimate_task_complexity(x, token_ids, external_context)
+            if required_complexity > self.threshold_high:
+                self.current_layers = min(self.max_layers, self.current_layers + 1)
+            elif required_complexity < self.threshold_low:
+                self.current_layers = max(1, self.current_layers - 1)
+
+    def real_time_feedback_adjustment(self):
+            # Adjust model based on stored feedback signals
+            if 'prediction_confidence' in self.feedback_signals and self.feedback_signals['prediction_confidence'] < 0.5:
+                self.current_layers = min(self.max_layers, self.current_layers + 1)
+            elif 'resource_availability' in self.feedback_signals and self.feedback_signals['resource_availability'] == 'low':
+                self.current_layers = max(1, self.current_layers - 1)
+
+    def update_feedback_signals(self, new_signals):
+        # Method to update feedback signals dynamically during model operation
+        self.feedback_signals.update(new_signals)
+
+    def estimate_task_complexity(self, x, token_ids, external_context):
+        complexity_estimate = len(token_ids) / self.max_input_length
+        return complexity_estimate
+
+    def apply_quantization(self):
+        # Apply quantization to the model's modules for optimization
+        quantize_dynamic(self.modules(), {nn.LSTM, nn.Linear}, dtype=torch.qint8)
+
+    def set_user_preferences(self, preferences):
+        if 'max_latency' in preferences:
+            self.latency_threshold = preferences['max_latency']
+
+    def forward(self, x, token_ids, external_context, task_identifier=None):
+        # Adjust model configuration based on the task and real-time feedback
+        if task_identifier:
+            self.adjust_model_configuration_based_on_task(task_identifier)
+        self.real_time_feedback_adjustment()
+
+        # Hierarchical processing stages
+        x = self.input_embedding(x, token_ids, external_context)
+        for _ in range(self.current_layers):
+            attention_module = ModuleRegistry.get_module('attention')()
+            x = attention_module(x)
+            x = self.dynamic_layer_adjustment(x)
+        output = self.output_layer(x)
+        return output
+
+
+# Example usage of ModuleRegistry to facilitate a modular architecture
+ModuleRegistry.register_module('attention', ModularAttention)
+
+
+dualm_model = DUALM(
+        input_size=512,
+        hidden_size=512,
+        output_size=1000,
+        max_layers=12,
+        num_heads=8,
+        vocab_size=10000,
+        embedding_dim=512,
+        context_size=[256],
+        dropout=0.1,
+        share_embedding_output=True,
+        num_tasks=1  # Assuming you're working with a single task; adjust accordingly if there are multiple tasks
+)
+
+
+# Assuming x is a batch of sequences with a sequence length of 50
+x = torch.rand(32, 50, 256)  # Batch size of 32, sequence length of 50, feature size of 256
+
+# Assuming token_ids are integer IDs for each token in the sequence
+token_ids = torch.randint(0, 10000, (32, 50))  # Batch size of 32, sequence length of 50
+
+# Assuming external_context is some form of additional information, could be zeros if not used
+external_context = torch.rand(32, 256)  # Batch size of 32, context size of 256
+
+# Example task identifier
+task_identifier = 'translation'  # Or any other task you define
+
+# New signals for feedback, dummy initialization
+new_signals = {'prediction_confidence': 0.7, 'resource_availability': 'high'}
+
+# User preferences, dummy initialization
+preferences = {'max_latency': 0.5}
+
+# Forward pass with input data, token IDs, external context, and task identifier
+output = dualm_model(x, token_ids, external_context, task_identifier)
+
+# Update feedback signals during model operation
+dualm_model.update_feedback_signals(new_signals)
+
+# Apply quantization post-training
+dualm_model.apply_quantization()
+
+# Set user preferences such as maximum latency
+dualm_model.set_user_preferences(preferences)
