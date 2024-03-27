@@ -1,0 +1,94 @@
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.nn.utils import clip_grad_norm_
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+
+# Define a custom dataset class
+class CustomDataset(Dataset):
+    def __init__(self, data, targets, token_ids, external_context, transform=None):
+        self.data = data
+        self.targets = targets
+        self.token_ids = token_ids
+        self.external_context = external_context
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        x = self.data[idx]
+        if self.transform:
+            x = self.transform(x)
+        return x, self.token_ids[idx], self.external_context[idx], self.targets[idx]
+
+# Define data augmentation transformations
+transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.RandomAffine(0, translate=(0.1, 0.1)),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.ToTensor(),
+])
+
+# Example usage:
+# train_dataset = CustomDataset(train_data, train_targets, train_token_ids, train_external_context, transform=transform)
+# train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# Define the validation dataset and data loader (if needed)
+# val_dataset = CustomDataset(val_data, val_targets, val_token_ids, val_external_context, transform=transform)
+# val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# Check if GPU is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Move the model to the appropriate device
+model.to(device)
+
+# Define the loss function
+criterion = nn.CrossEntropyLoss()
+
+# Define the optimizer
+learning_rate = 0.001
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Learning rate scheduler
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2, verbose=True)
+
+# Define the training loop
+def train_model(model, train_loader, optimizer, criterion, scheduler, num_epochs=3):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for batch_idx, (x, token_ids, external_context, y) in enumerate(train_loader):
+            # Move data to the appropriate device
+            x, token_ids, external_context, y = x.to(device), token_ids.to(device), external_context.to(device), y.to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            output = model(x, token_ids, external_context)
+
+            # Calculate the loss
+            loss = criterion(output, y)
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient clipping
+            clip_grad_norm_(model.parameters(), max_norm=1)
+
+            # Optimize
+            optimizer.step()
+
+            running_loss += loss.item()
+
+            if batch_idx % 100 == 99:  # Print every 100 mini-batches
+                print(f'Epoch: {epoch + 1}, Batch: {batch_idx + 1}, Loss: {running_loss / 100}')
+                running_loss = 0.0
+        
+        # Update learning rate
+        scheduler.step(running_loss)
+
+# Example usage:
+# train_model(model, train_loader, optimizer, criterion, scheduler, num_epochs=5)
