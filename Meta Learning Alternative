@@ -1,0 +1,43 @@
+import torch
+
+def meta_learn(model, optimizer, data_loader, loss_function, inner_steps=1, inner_lr=0.01, device='cuda'):
+    model.train()
+    total_meta_loss = 0.0
+
+    for x, y in data_loader:
+        x, y = x.to(device), y.to(device)
+        
+        # Save the original parameters before the inner loop updates
+        original_params = {name: param.clone() for name, param in model.named_parameters()}
+        
+        # Inner loop: Adapt the model parameters to the current task
+        optimizer.zero_grad()
+        for _ in range(inner_steps):
+            pred = model(x)
+            loss = loss_function(pred, y)
+            loss.backward()
+            with torch.no_grad():
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param -= inner_lr * param.grad
+                        param.grad = None  # Clear gradients after updating
+
+        # Compute meta-loss with the adapted parameters
+        meta_pred = model(x)
+        meta_loss = loss_function(meta_pred, y)
+        total_meta_loss += meta_loss.item()
+        
+        # Restore original parameters
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                param.copy_(original_params[name])
+
+        # Accumulate gradients from the meta-loss
+        meta_loss.backward()
+
+    # Apply the outer loop update based on accumulated gradients
+    optimizer.step()
+    optimizer.zero_grad()  # Clear gradients after the optimizer step
+
+    average_meta_loss = total_meta_loss / len(data_loader)
+    return average_meta_loss
