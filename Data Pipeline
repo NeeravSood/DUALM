@@ -1,0 +1,120 @@
+import nltk
+import re
+import pytest
+from nltk.corpus import gutenberg
+from nltk.tokenize import word_tokenize
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.nn.utils.rnn import pad_sequence
+import torch
+import logging
+
+nltk.download('punkt')
+nltk.download('gutenberg')
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+
+def preprocess_text(text):
+    """
+    Preprocess text by lowercasing and removing non-alphanumeric characters,
+    with specific handling for apostrophes.
+    """
+    try:
+        text = text.lower()
+        text = re.sub(r"\s'\s", " ", text)
+        text = re.sub(r'[^a-z0-9\s]', '', text)
+    except Exception as e:
+        logger.error(f"Error in text preprocessing: {e}")
+        return None
+    return text
+
+class Tokenizer:
+    """
+    Tokenizer class that converts text to a sequence of token indices and manages the vocabulary.
+    """
+    def __init__(self, texts, vocab_size=20000):
+        self.vocab_size = vocab_size
+        try:
+            self.vocab = self.build_vocab(texts)
+            logger.info(f"Vocabulary built with size: {len(self.vocab)}")
+        except Exception as e:
+            logger.error(f"Error in building vocabulary: {e}")
+            self.vocab = {}
+
+    def build_vocab(self, texts):
+        token_freqs = Counter()
+        for text in texts:
+            processed_text = preprocess_text(text)
+            if processed_text:
+                tokens = word_tokenize(processed_text)
+                token_freqs.update(tokens)
+            else:
+                logger.warning("Skipping a text due to preprocessing error.")
+        vocab = {'<PAD>': 0, '<UNK>': 1}
+        vocab.update({token: idx + 2 for idx, (token, _) in enumerate(token_freqs.most_common(self.vocab_size - 2))})
+        return vocab
+
+    def tokenize(self, text):
+        if not text:
+            logger.error("Empty text provided for tokenization.")
+            return []
+        return [self.vocab.get(word, self.vocab['<UNK>']) for word in word_tokenize(text)]
+
+class GutenbergDataset(Dataset):
+    """
+    Dataset class for Gutenberg dataset with tokenization and data splitting.
+    """
+    def __init__(self, texts, tokenizer, split_ratio=(0.8, 0.1, 0.1)):
+        assert sum(split_ratio) == 1, "Split ratios must sum to 1"
+        
+        self.tokenizer = tokenizer
+        self.samples = []
+        for text in texts:
+            processed_text = preprocess_text(text)
+            if processed_text and processed_text.strip() != '':
+                tokenized_text = self.tokenizer.tokenize(processed_text)
+                if tokenized_text:
+                    self.samples.append(torch.tensor(tokenized_text))
+                else:
+                    logger.warning("Skipping a text due to tokenization error.")
+            else:
+                logger.warning("Skipping a text due to preprocessing error.")
+
+        total_size = len(self.samples)
+        train_size = int(total_size * split_ratio[0])
+        val_size = int(total_size * split_ratio[1])
+        test_size = total_size - train_size - val_size
+        self.train_dataset, self.val_dataset, self.test_dataset = random_split(self.samples, [train_size, val_size, test_size])
+        logger.info("Dataset split into training, validation, and test sets.")
+
+    def get_datasets(self):
+        return self.train_dataset, self.val_dataset, self.test_dataset
+
+def collate_batch(batch):
+    """
+    Collate function for dynamic batch padding.
+    """
+    if not batch:
+        logger.error("Empty batch received for collation.")
+        return None
+    return pad_sequence(batch, padding_value=0, batch_first=True)
+
+# Pytest unit tests
+def test_preprocess_text():
+    assert preprocess_text("Hello, World!") == "hello world"
+    assert preprocess_text(None) is None
+
+def test_tokenizer():
+    sample_texts = ["Hello world", "Hello again world"]
+    tokenizer = Tokenizer(sample_texts)
+    assert "hello" in tokenizer.vocab
+    assert "nonexistentword" not in tokenizer.vocab
+
+# Validate on a subset (can be part of a test or a separate validation routine)
+def validate_on_subset():
+    texts = [gutenberg.raw(file_id) for file_id in gutenberg.fileids()][:5]  # Small subset for validation
+    tokenizer = Tokenizer(texts)
+    dataset = GutenbergDataset(texts, tokenizer)
+    train_dataset,
