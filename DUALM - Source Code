@@ -215,6 +215,34 @@ class MultiLevelAttention(nn.Module):
         return x
 
 
+class TransformerModule(nn.Module):
+    def __init__(self, embed_size, num_heads, ff_intermediate_size, dropout_rate):
+        super(TransformerModule, self).__init__()
+        self.layer_norm1 = nn.LayerNorm(embed_size)
+        self.self_attention = nn.MultiheadAttention(embed_size, num_heads, dropout=dropout_rate)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.layer_norm2 = nn.LayerNorm(embed_size)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_size, ff_intermediate_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(ff_intermediate_size, embed_size),
+        )
+        self.dropout2 = nn.Dropout(dropout_rate)
+
+    def forward(self, src):
+        # Self-attention
+        src2 = self.layer_norm1(src)
+        attn_output, _ = self.self_attention(src2, src2, src2)
+        src = src + self.dropout1(attn_output)
+
+        # Feed-forward
+        src2 = self.layer_norm2(src)
+        src2 = self.feed_forward(src2)
+        src = src + self.dropout2(src2)
+        return src
+
+
 class DynamicInputEmbedding(nn.Module):
     def __init__(self, vocab_size, embedding_dim, context_size, use_context=True, dropout_rate=0.1, num_tasks=0):
         super(DynamicInputEmbedding, self).__init__()
@@ -440,66 +468,58 @@ class DynamicKWinnersTakeAll(torch.nn.Module):
         # Reshape output back to original input shape
         return output.view(batch_size, seq_length, num_features)
 
+
 class DynamicLayerAdjustment(nn.Module):
-            """
-            Dynamically adjust and select between different neural network layer types.
+    def __init__(self, max_layers, input_size, hidden_size, num_heads, dropout_rate=0.1):
+        super(DynamicLayerAdjustment, self).__init__()
+        self.max_layers = max_layers
+        self.layer_selectors = nn.ModuleList([nn.Linear(hidden_size, 5) for _ in range(
+            max_layers)])  # Now outputs 5 for LSTM, GRU, Attention, Transformer, and Feedforward
+        self.dropout = nn.Dropout(dropout_rate)
 
-            Args:
-                max_layers (int): Maximum number of layers.
-                input_size (int): Size of input features.
-                hidden_size (int): Size of hidden features.
-                dropout_rate (float): Dropout rate.
-                activation (str): Activation function.
-            """
+        # Initialize modules for each layer type
+        self.lstm_layers = nn.ModuleList(
+            [nn.LSTM(input_size, hidden_size, batch_first=True) for _ in range(max_layers)])
+        self.gru_layers = nn.ModuleList([nn.GRU(input_size, hidden_size, batch_first=True) for _ in range(max_layers)])
+        self.attention_layers = nn.ModuleList(
+            [AdaptiveAttentionModule(hidden_size, hidden_size, hidden_size, num_heads) for _ in range(max_layers)])
+        self.transformer_layers = nn.ModuleList(
+            [TransformerModule(hidden_size, num_heads, hidden_size * 4, dropout_rate) for _ in range(max_layers)])
+        self.feedforward_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 4),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(hidden_size * 4, hidden_size)
+            ) for _ in range(max_layers)
+        ])
 
-            def __init__(self, max_layers, input_size, hidden_size, num_heads, dropout_rate=0.1, activation='relu'):
-                super(DynamicLayerAdjustment, self).__init__()
-                if max_layers <= 0:
-                    raise ValueError("max_layers must be a positive integer.")
+    def forward(self, x):
+        for i in range(self.max_layers):
+            selection_logits = self.layer_selectors[i](x[:, -1, :])
+            selection_probabilities = F.softmax(selection_logits, dim=-1)
 
-                self.max_layers = max_layers
-                self.layer_selectors = nn.ModuleList([nn.Linear(hidden_size, 4) for _ in range(max_layers)])
-                self.dropout = nn.Dropout(dropout_rate)
+            # Dynamically select the layer based on selection probabilities
+            max_index = selection_probabilities.max(dim=1)[1]  # Get the indices of the max probabilities
 
-                # Defining layer types
-                self.lstm_layers = nn.ModuleList(
-                    [nn.LSTM(input_size, hidden_size, batch_first=True) for _ in range(max_layers)])
-                self.gru_layers = nn.ModuleList(
-                    [nn.GRU(input_size, hidden_size, batch_first=True) for _ in range(max_layers)])
-                self.attention_layers = nn.ModuleList(
-                    [AdaptiveAttentionModule(hidden_size, hidden_size, hidden_size, num_heads) for _ in
-                     range(max_layers)])
-                self.feedforward_layers = nn.ModuleList([
-                    nn.Sequential(
-                        nn.Linear(hidden_size, hidden_size * 4),
-                        DynamicKWinnersTakeAll(sparsity_level=0.1),
-                        nn.Dropout(dropout_rate),
-                        nn.Linear(hidden_size * 4, hidden_size)
-                    ) for _ in range(max_layers)
-                ])
+            if max_index == 0:
+                x, _ = self.lstm_layers[i](x)
+            elif max_index == 1:
+                x, _ = self.gru_layers[i](x)
+            elif max_index == 2:
+                x = self.attention_layers[i](x)
+            elif max_index == 3:
+                x = self.transformer_layers[i](x)
+            elif max_index == 4:
+                x = self.feedforward_layers[i](x)
+            else:
+                raise Exception("Invalid layer type selected.")
 
-                # Softmax for layer selection
-                self.selection_softmax = nn.Softmax(dim=1)
+            # Apply dropout after the selected layer's output (if necessary)
+            x = self.dropout(x)
 
-            def forward(self, x):
-                    for i in range(self.max_layers):
-                        selection_scores = F.gumbel_softmax(self.layer_selectors[i](x[:, -1, :]), dim=1)
+        return x
 
-                        lstm_output, _ = self.lstm_layers[i](x)
-                        gru_output, _ = self.gru_layers[i](x)
-                        attention_output = self.attention_layers[i](x)
-                        feedforward_output = self.feedforward_layers[i](x)
-
-                        # Dynamic composition of layer outputs
-                        layer_outputs = (selection_scores[:, 0:1].unsqueeze(-1) * lstm_output +
-                                         selection_scores[:, 1:2].unsqueeze(-1) * gru_output +
-                                         selection_scores[:, 2:3].unsqueeze(-1) * attention_output +
-                                         selection_scores[:, 3:4].unsqueeze(-1) * feedforward_output)
-
-                        # Update x for the next layer
-                        x = layer_outputs + x  # Residual connection could be considered
-
-                    return x
 
 class DUALM(nn.Module):
     def __init__(self, hidden_size, output_size, max_layers, num_heads, vocab_size, embedding_dim, context_size, dropout, share_embedding_output, num_tasks, input_size=256, intermediate_size = 512, desired_size=10000):
@@ -711,6 +731,8 @@ class HierarchicalDUALM(DUALM):
 
 # Example usage of ModuleRegistry to facilitate a modular architecture
 ModuleRegistry.register_module('attention', ModularAttention)
+ModuleRegistry.register_module('transformer', TransformerModule)
+
 
 
 dualm_model = DUALM(
